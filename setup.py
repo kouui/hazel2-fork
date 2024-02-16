@@ -19,8 +19,9 @@ import setuptools
 from setuptools import find_packages, setup
 from setuptools.extension import Extension
 from distutils.ccompiler import CCompiler
-from distutils.errors import DistutilsExecError, CompileError
-from distutils.unixccompiler import UnixCCompiler
+from distutils.errors import DistutilsExecError, CompileError, LinkError
+from distutils.unixccompiler import UnixCCompiler as UnixCCompilerOrigin
+from distutils.ccompiler import gen_lib_options
 
 from setuptools.command.build_ext import build_ext
 from distutils.dep_util import newer_group
@@ -35,11 +36,96 @@ import numpy
 import glob
 import re
 
+if sys.platform == 'darwin':
+    import _osx_support
+
 DOCSTRING = __doc__.strip().split("\n")
 
 tmp = open('hazel/__init__.py', 'r').read()
 author = re.search('__author__ = "([^"]+)"', tmp).group(1)
 version = re.search('__version__ = "([^"]+)"', tmp).group(1)
+
+
+def is_macos_arm64():
+    # Check if the OS is macOS
+    if platform.system() != 'Darwin':
+        return False
+    
+    # Check if the architecture is ARM64
+    return platform.machine() == 'arm64' or os.uname().machine == 'arm64'
+
+
+class UnixCCompiler(UnixCCompilerOrigin):
+    def link(self, target_desc, objects,
+             output_filename, output_dir=None, libraries=None,
+             library_dirs=None, runtime_library_dirs=None,
+             export_symbols=None, debug=0, extra_preargs=None,
+             extra_postargs=None, build_temp=None, target_lang=None):
+        objects, output_dir = self._fix_object_args(objects, output_dir)
+        fixed_args = self._fix_lib_args(libraries, library_dirs,
+                                        runtime_library_dirs)
+        libraries, library_dirs, runtime_library_dirs = fixed_args
+
+        lib_opts = gen_lib_options(self, library_dirs, runtime_library_dirs,
+                                   libraries)
+        if not isinstance(output_dir, (str, type(None))):
+            raise TypeError("'output_dir' must be a string or None")
+        if output_dir is not None:
+            output_filename = os.path.join(output_dir, output_filename)
+
+        if self._need_link(objects, output_filename):
+            ld_args = (objects + self.objects +
+                       lib_opts + ['-o', output_filename])
+            if debug:
+                ld_args[:0] = ['-g']
+            if extra_preargs:
+                ld_args[:0] = extra_preargs
+            if extra_postargs:
+                ld_args.extend(extra_postargs)
+            self.mkpath(os.path.dirname(output_filename))
+            try:
+                if target_desc == CCompiler.EXECUTABLE:
+                    linker = self.linker_exe[:]
+                else:
+                    linker = self.linker_so[:]
+                if target_lang == "c++" and self.compiler_cxx:
+                    # skip over environment variable settings if /usr/bin/env
+                    # is used to set up the linker's environment.
+                    # This is needed on OSX. Note: this assumes that the
+                    # normal and C++ compiler have the same environment
+                    # settings.
+                    i = 0
+                    if os.path.basename(linker[0]) == "env":
+                        i = 1
+                        while '=' in linker[i]:
+                            i += 1
+
+                    if os.path.basename(linker[i]) == 'ld_so_aix':
+                        # AIX platforms prefix the compiler with the ld_so_aix
+                        # script, so we need to adjust our linker index
+                        offset = 1
+                    else:
+                        offset = 0
+
+                    linker[i+offset] = self.compiler_cxx[i]
+
+                if sys.platform == 'darwin':
+                    linker = _osx_support.compiler_fixup(linker, ld_args)
+                if is_macos_arm64():
+                    ## remove duplicate
+                    linker0 = [v for v in linker]
+                    linker = []
+                    for item in linker0:
+                        if item not in linker:
+                            linker.append(item)
+                    linker[4] = '-W'  ## remove -Rpach/path/to/conda/env/libs
+                    linker = [v for v in linker[:5]]  ## remove -L/path/to/conda/env/libs
+                self.spawn(linker + ld_args)
+            except DistutilsExecError as msg:
+                raise LinkError(msg)
+        else:
+            log.debug("skipping %s (up-to-date)", output_filename)
+
 
 def _compile(self, obj, src, ext, cc_args, extra_postargs, pp_opts):
     compiler_so = self.compiler_so    
@@ -66,6 +152,8 @@ def _compile(self, obj, src, ext, cc_args, extra_postargs, pp_opts):
                    extra_postargs)
     except DistutilsExecError as msg:
         raise CompileError(msg)
+    
+    
 UnixCCompiler._compile = _compile
 
 
